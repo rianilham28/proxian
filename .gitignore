@@ -1,0 +1,8 @@
+# local tooling / build fallbacks — the nightly pool itself (out/) IS tracked
+__pycache__/
+*.pyc
+.bin/
+bin/
+work/
+.proxian-src.tgz
+.venv/
