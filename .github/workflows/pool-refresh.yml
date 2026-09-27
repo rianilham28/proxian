@@ -18,7 +18,8 @@ name: Pool refresh
 # auth-required rows from out/ before committing, and refuses to overwrite a
 # good pool when live collapses — which a shared datacenter egress IP does
 # against these free feeds without a rotating proxy.
-# Set the PROXPLORE_PROXY_URL secret to a rotating gateway to raise the live yield.
+# Egress chain per run: PROXPLORE_PROXY_URL gateway (when it authenticates) ->
+# a previously validated live proxy from the committed pool -> direct runner IP.
 
 on:
   schedule:
@@ -102,20 +103,83 @@ jobs:
           bin/proxalyze  --version
         working-directory: ${{ github.workspace }}
 
-      # GitHub renders an unset secret as "" (not absent); proxplore binds
-      # --proxy-url to $PROXPLORE_PROXY_URL via clap's env trait, which reads a
-      # present-but-empty var as a proxy URL -> wreq RelativeUrlWithoutBase.
-      - name: Harvest (proxplore)
+      # Egress chain: the configured gateway first (when it still authenticates),
+      # else a previously VALIDATED live proxy from the committed pool — pool
+      # order is best-first (rank, speed), http(s) only since wreq relays over
+      # HTTP CONNECT, auth-required rows skipped (they need a login we lack) —
+      # else direct from the runner (some feeds blackhole that, so the gate
+      # still guards the pool). Winner goes to $GITHUB_ENV for Harvest.
+      - name: Pick harvest relay
         env:
-          PROXPLORE_PROXY_URL: ${{ secrets.PROXPLORE_PROXY_URL }}
+          SECRET_PROXY: ${{ secrets.PROXPLORE_PROXY_URL }}
         run: |
           set -euo pipefail
-          if [ -z "${PROXPLORE_PROXY_URL:-}" ]; then unset PROXPLORE_PROXY_URL; fi
+          ws="$GITHUB_WORKSPACE"
+          ok() { # must complete a small HTTPS GET through the candidate
+            curl -fsS --max-time 8 -x "$1" -o /dev/null \
+              https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt
+          }
+          relay=""
+          if [ -n "${SECRET_PROXY:-}" ]; then
+            if ok "$SECRET_PROXY"; then
+              relay="$SECRET_PROXY"
+              echo "relay: configured gateway is alive"
+            else
+              echo "::warning::configured gateway failed its probe (407/expired?) — falling back to pool"
+            fi
+          fi
+          if [ -z "$relay" ] && [ -f "$ws/out/proxies.jsonl" ]; then
+            echo "relay: probing committed pool for a live http(s) hop..."
+            while IFS= read -r cand; do
+              if ok "$cand"; then relay="$cand"; break; fi
+              echo "  dead: $cand"
+            done < <(python3 - "$ws/out/proxies.jsonl" <<'PY'
+          import json, sys
+          probed = 0
+          for ln in open(sys.argv[1]):
+              ln = ln.strip()
+              if not ln:
+                  continue
+              r = json.loads(ln)
+              if "auth-required" in (r.get("tags") or []):
+                  continue
+              if r.get("type") in ("http", "https"):
+                  print(r["proxy"])
+                  probed += 1
+                  if probed >= 15:  # bound worst-case probing time
+                      break
+          PY
+          )
+          fi
+          if [ -n "$relay" ]; then
+            echo "PROXPLORE_PROXY_URL=$relay" >> "$GITHUB_ENV"
+            echo "relay: harvesting through $relay"
+          else
+            echo "::warning::no working relay — harvesting direct from the runner"
+          fi
+
+      # Harvest exit contract (main.rs): 0 full · 1 failed · 2 partial — a
+      # single relay hop can lose deep feeds, so partial (data kept) passes
+      # through to the gate instead of failing the run; failed (no usable
+      # output) still aborts.
+      - name: Harvest (proxplore)
+        run: |
+          set -euo pipefail
           ws="$GITHUB_WORKSPACE"
           mkdir -p "$ws/work"
           args=(--output "$ws/work/proxies.txt")
           if [ -n "${{ inputs.providers }}" ]; then args+=(--providers "${{ inputs.providers }}"); fi
-          "$ws/bin/proxplore" "${args[@]}"
+          rc=0
+          "$ws/bin/proxplore" "${args[@]}" || rc=$?
+          case "$rc" in
+            0) echo "harvest: full" ;;
+            2) echo "::warning::harvest partial (exit 2) — candidates kept, gate will judge" ;;
+            *) echo "::error::harvest failed (exit $rc)"; exit "$rc" ;;
+          esac
+          if [ ! -s "$ws/work/proxies.txt" ]; then
+            echo "::error::harvest produced no candidates"
+            exit 1
+          fi
           echo "harvested $(wc -l < "$ws/work/proxies.txt") candidates"
 
       - name: Validate (proxalyze)
