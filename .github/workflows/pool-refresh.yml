@@ -12,10 +12,12 @@ name: Pool refresh
 #
 # Quality note: proxalyze writes a survivor when status is "live" OR
 # "auth-required" (main.rs:223), but an "auth-required" proxy is only
-# reachable-with-a-login, NOT proven usable. So the gate measures the LIVE count
-# (= survivors minus auth-required, == proxalyze's verdict "live" number) and
-# refuses to overwrite a good pool when live collapses — which a shared
-# datacenter egress IP does against these free feeds without a rotating proxy.
+# reachable-with-a-login, NOT proven usable. So the committed pool is
+# LIVE-only: the gate measures the LIVE count (= survivors minus
+# auth-required, == proxalyze's verdict "live" number), drops the
+# auth-required rows from out/ before committing, and refuses to overwrite a
+# good pool when live collapses — which a shared datacenter egress IP does
+# against these free feeds without a rotating proxy.
 # Set the PROXPLORE_PROXY_URL secret to a rotating gateway to raise the live yield.
 
 on:
@@ -68,19 +70,31 @@ jobs:
       - name: Fetch release binaries
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/bin" /tmp/dl
+          mkdir -p "$GITHUB_WORKSPACE/bin"
           fetch() { # repo  tag  name
-            local repo tag name pat dir
+            local repo tag name pat dl unpack tarball
             repo="$1"; tag="$2"; name="$3"
-            pat="*-${TARGET}.tar.gz"
+            # Scope the pattern to THIS tool and use a fresh download dir:
+            # a shared dir with "*-$TARGET.tar.gz" made find pick the other
+            # tool's tarball, silently install nothing, then die at --version.
+            pat="${name}-*-${TARGET}.tar.gz"
+            dl=$(mktemp -d)
             if [ -n "$tag" ]; then
-              gh release download "$tag" -R "$repo" --pattern "$pat" -D /tmp/dl
+              gh release download "$tag" -R "$repo" --pattern "$pat" -D "$dl"
             else
-              gh release download -R "$repo" --pattern "$pat" -D /tmp/dl  # no tag => latest
+              gh release download -R "$repo" --pattern "$pat" -D "$dl"  # no tag => latest
             fi
-            local tarball; tarball=$(find /tmp/dl -name "$pat" | head -1)
-            dir=$(mktemp -d); tar -xzf "$tarball" -C "$dir"
-            find "$dir" -type f -name "$name" -exec install -m 0755 {} "$GITHUB_WORKSPACE/bin/$name" \;
+            tarball=$(find "$dl" -name "$pat" | head -1)
+            if [ -z "$tarball" ]; then
+              echo "::error::no asset matching '$pat' in $repo${tag:+ @ $tag}"
+              exit 1
+            fi
+            unpack=$(mktemp -d); tar -xzf "$tarball" -C "$unpack"
+            find "$unpack" -type f -name "$name" -exec install -m 0755 {} "$GITHUB_WORKSPACE/bin/$name" \;
+            if [ ! -x "$GITHUB_WORKSPACE/bin/$name" ]; then
+              echo "::error::$name not found inside $tarball"
+              exit 1
+            fi
           }
           fetch "$PROXPLORE_REPO"  "${{ inputs.proxplore_version }}"  proxplore
           fetch "$PROXALYZE_REPO"  "${{ inputs.proxalyze_version }}"  proxalyze
@@ -127,20 +141,31 @@ jobs:
         run: |
           set -euo pipefail
           ws="$GITHUB_WORKSPACE"
-          stats=$(python3 - "$ws/out/proxies.jsonl" <<'PY'
+          stats=$(python3 - "$ws/out/proxies.jsonl" "$ws/out/proxies.txt" <<'PY'
           import json, sys
-          total = auth = exit_live = 0
-          for ln in open(sys.argv[1]):
-              ln = ln.strip()
+          jsonl, txt = sys.argv[1], sys.argv[2]
+          kept, total, auth, exit_live = [], 0, 0, 0
+          for raw in open(jsonl):
+              ln = raw.strip()
               if not ln:
                   continue
               total += 1
               r = json.loads(ln)
               if "auth-required" in (r.get("tags") or []):
                   auth += 1
+                  continue
               if r.get("exit_ip"):
                   exit_live += 1
-          # survivor = live OR auth-required, so genuinely-live = total - auth-required
+              kept.append((raw, r["proxy"]))
+          # survivor = live OR auth-required, so genuinely-live = total - auth-required.
+          # The committed pool is LIVE-only: auth-required rows are measured
+          # above, then dropped from both output files (kept rows are written
+          # back byte-for-byte; txt is rebuilt from their proxy fields so the
+          # two files stay row-consistent).
+          with open(jsonl, "w") as f:
+              f.writelines(raw for raw, _ in kept)
+          with open(txt, "w") as f:
+              f.writelines(proxy + "\n" for _, proxy in kept)
           print(total - auth, auth, exit_live)
           PY
           )
@@ -149,6 +174,7 @@ jobs:
           echo "auth=$auth" >> "$GITHUB_OUTPUT"
           echo "exit_live=$exit_live" >> "$GITHUB_OUTPUT"
           echo "survivors: $((live + auth)) = live $live + auth-required $auth ($exit_live proved exit-IP)"
+          echo "committed pool is live-only: dropped $auth auth-required rows"
           min_live="${{ inputs.min_live || '100' }}"
           if [ "$live" -lt "$min_live" ]; then
             echo "::error::only $live LIVE proxies (< min_live=$min_live); keeping the last-good pool, not committing"
@@ -168,5 +194,5 @@ jobs:
             exit 0
           fi
           # [skip ci]: pushing to main would otherwise re-trigger CI's push job.
-          git commit -m "chore(pool): refresh validated proxies ($(date -u +%Y-%m-%d)) — live ${{ steps.gate.outputs.live }} · auth-required ${{ steps.gate.outputs.auth }} [skip ci]"
+          git commit -m "chore(pool): refresh validated proxies ($(date -u +%Y-%m-%d)) — live ${{ steps.gate.outputs.live }}, dropped ${{ steps.gate.outputs.auth }} auth-required [skip ci]"
           git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
